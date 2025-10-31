@@ -16,5 +16,5 @@ VOLUME ["/data"]
 ENV PORT=3000
 EXPOSE 3000
 
-CMD ["node", "servidor.js"]
+CMD ["node", "server.js"]
 
