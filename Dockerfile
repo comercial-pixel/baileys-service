@@ -1,18 +1,24 @@
 FROM node:20-alpine
+
+# Precisamos do git para dependências instaladas via repositórios
+RUN apk add --no-cache git
+
 WORKDIR /app
 
-# Copia arquivos de dependência e instala
+# Copia manifestos e instala dependências (sem dev)
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm config set audit false \
+ && npm config set fund false \
+ && npm install --omit=dev
 
-# Copia todo o restante do projeto
+# Copia o restante do projeto
 COPY . .
 
-# Volume para persistir sessões do WhatsApp
+# Volume para persistir sessões
 VOLUME ["/data"]
 
 ENV PORT=3000
 EXPOSE 3000
 
-# Corrigido para seu arquivo real: servidor.js
+# Seu arquivo principal é servidor.js
 CMD ["node", "servidor.js"]
