@@ -1,0 +1,8 @@
+# Ignora apenas o que não é necessário
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.env.*
+.DS_Store
