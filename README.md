@@ -23,3 +23,7 @@ docker run -p 3000:3000 -v $(pwd)/data:/data --env-file .env baileys-service
 - Add a persistent volume mounted at `/data`.
 - Add env vars from `.env.example`.
 - Health check: `/healthz`
+---
+
+### Forçar rebuild Render
+Atualização técnica para limpar cache e refazer o build no Render.
