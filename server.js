@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -12,13 +11,11 @@ import {
 import fs from "fs";
 import path from "path";
 
-// =====================
-// Configuração básica
-// =====================
+// ----------------- CONFIG -----------------
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
-// CORS simples (ajuste o domínio se quiser limitar)
+// CORS simples (ajuste o domínio se quiser)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -32,56 +29,38 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const JWT_SECRET = process.env.JWT_SECRET || ""; // se vazio, auth desabilitada
 
-try {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-} catch (e) {
-  // em alguns ambientes /data já existe e é somente leitura
-  log.warn({ err: e?.message }, "Não foi possível garantir DATA_DIR");
-}
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// =====================
-// Autenticação flexível
-//   - aceita segredo simples OU JWT
-//   - lê de Authorization, query ?token= ou body.token
-// =====================
-function looksLikeJwt(str) {
-  return typeof str === "string" && str.split(".").length === 3;
-}
-
+// ----------------- AUTH -----------------
 function requireAuth(req, res, next) {
-  if (!JWT_SECRET) return next(); // se não houver segredo, desliga auth
+  if (!JWT_SECRET) return next(); // desabilita se não houver segredo definido
 
-  const hdr = req.headers.authorization || "";
-  const tokenFromHeader = hdr.startsWith("Bearer ")
-    ? hdr.slice(7).trim()
+  const authHeader = req.headers.authorization || "";
+  const tokenFromHeader = authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7).trim()
     : null;
-  const tokenFromQuery = req.query.token;
+
+  const tokenFromQuery = req.query?.token;
   const tokenFromBody = req.body?.token;
+
   const token = tokenFromHeader || tokenFromQuery || tokenFromBody;
 
   if (!token) {
-    log.warn("[Auth] ❌ missing_token");
+    console.warn("[Auth] ❌ missing_token");
     return res.status(401).json({ error: "missing_token" });
   }
-
   try {
-    if (looksLikeJwt(token)) {
-      jwt.verify(token, JWT_SECRET);
-    } else {
-      if (token !== JWT_SECRET) throw new Error("secret_mismatch");
-    }
-    log.info("[Auth] ✅ token OK");
+    jwt.verify(token, JWT_SECRET);
+    console.log("[Auth] ✅ Token verificado");
     next();
   } catch (e) {
-    log.error({ err: e?.message }, "[Auth] ❌ invalid_token");
+    console.error("[Auth] ❌ invalid_token:", e.message);
     return res.status(401).json({ error: "invalid_token" });
   }
 }
 
-// =====================
-// Gerenciamento de sessões Baileys
-// =====================
-const sessions = new Map(); // sessionId -> meta { sock, status, lastQr, connectedAt }
+// ----------------- SESSÕES -----------------
+const sessions = new Map(); // sessionId -> meta
 
 async function getOrCreateSession(sessionId) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
@@ -96,42 +75,35 @@ async function getOrCreateSession(sessionId) {
     version,
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: "warn" }),
   });
 
   const meta = { sock, status: "starting", lastQr: null, connectedAt: null };
   sessions.set(sessionId, meta);
 
   sock.ev.on("creds.update", saveCreds);
-
   sock.ev.on("connection.update", (u) => {
     const { connection, lastDisconnect, qr } = u || {};
 
     if (qr) {
       meta.lastQr = qr;
       meta.status = "qr";
-      log.info({ sessionId }, "QR atualizado");
+      log.info({ sessionId }, "QR updated");
     }
-
     if (connection === "open") {
       meta.status = "connected";
       meta.connectedAt = Date.now();
       meta.lastQr = null;
-      log.info({ sessionId }, "Sessão conectada");
+      log.info({ sessionId }, "Session connected");
     }
-
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
       if (shouldReconnect) {
         meta.status = "reconnecting";
-        log.warn({ sessionId, code }, "Conexão fechada, tentando reconectar...");
-        setTimeout(() => getOrCreateSession(sessionId).catch(() => {}), 1500);
+        log.warn({ sessionId, code }, "Reconnecting...");
+        setTimeout(() => getOrCreateSession(sessionId), 1500);
       } else {
-        log.warn({ sessionId, code }, "Sessão deslogada, limpando credenciais");
-        try {
-          fs.rmSync(authDir, { recursive: true, force: true });
-        } catch {}
+        log.warn({ sessionId, code }, "Logged out, cleaning session");
         sessions.delete(sessionId);
       }
     }
@@ -140,11 +112,19 @@ async function getOrCreateSession(sessionId) {
   return meta;
 }
 
-// =====================
-// Rotas
-// =====================
+// ----------------- HEALTH & INFO -----------------
 app.get("/healthz", (req, res) => res.json({ ok: true, t: Date.now() }));
+app.get("/version", (req, res) => {
+  res.json({
+    ok: true,
+    port: PORT,
+    dataDir: DATA_DIR,
+    auth: !!JWT_SECRET,
+    note: "Se auth=true, o token pode vir via header Authorization, query ?token= ou body.token",
+  });
+});
 
+// ----------------- ROTAS PROTEGIDAS -----------------
 app.get("/sessions/:id/status", requireAuth, (req, res) => {
   const meta = sessions.get(req.params.id);
   res.json({
@@ -154,15 +134,9 @@ app.get("/sessions/:id/status", requireAuth, (req, res) => {
 });
 
 app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
-  log.info({ path: req.path, id: req.params.id }, "GET QR");
   const meta = await getOrCreateSession(req.params.id);
-
-  if (meta.status === "connected") {
-    return res.json({ status: "connected" });
-  }
-  if (!meta.lastQr) {
-    return res.status(202).json({ status: meta.status ?? "starting" });
-  }
+  if (meta.status === "connected") return res.json({ status: "connected" });
+  if (!meta.lastQr) return res.status(202).json({ status: meta.status ?? "starting" });
   const dataUrl = await QRCode.toDataURL(meta.lastQr);
   res.json({ status: meta.status, dataUrl });
 });
@@ -170,9 +144,9 @@ app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
 app.post("/sessions/:id/messages", requireAuth, async (req, res) => {
   const { to, text } = req.body || {};
   const meta = sessions.get(req.params.id);
-  if (!meta || meta.status !== "connected") {
+  if (!meta || meta.status !== "connected")
     return res.status(409).json({ error: "session_not_connected" });
-  }
+
   const jid = `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
   await meta.sock.sendMessage(jid, { text: text || "" });
   res.json({ ok: true });
@@ -185,16 +159,7 @@ app.post("/sessions/:id/disconnect", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// =====================
-// Inicialização
-// =====================
-process.on("uncaughtException", (e) => log.error(e, "uncaughtException"));
-process.on("unhandledRejection", (e) => log.error(e, "unhandledRejection"));
-
+// ----------------- START -----------------
 app.listen(PORT, () => {
-  log.info({
-    PORT,
-    DATA_DIR,
-    AUTH_ENABLED: !!JWT_SECRET,
-  }, "Baileys API listening");
+  log.info(`Baileys API listening on :${PORT}`);
 });
