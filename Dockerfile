@@ -1,20 +1,16 @@
 FROM node:20-alpine
-RUN apk add --no-cache git
-WORKDIR /app
 
+WORKDIR /app
+RUN apk add --no-cache git
 COPY package*.json ./
 RUN npm config set audit false \
  && npm config set fund false \
  && npm install --omit=dev
-
 COPY . .
 
-# 👇 Debug: mostrar se servidor.js está na imagem
-RUN echo "=== CONTEÚDO DE /app ===" && ls -la /app
+# healthcheck opcional (Render não usa por padrão, mas ajuda)
+HEALTHCHECK CMD wget -qO- http://localhost:${PORT:-3000}/healthz || exit 1
 
-VOLUME ["/data"]
 ENV PORT=3000
 EXPOSE 3000
-
 CMD ["node", "server.js"]
-
