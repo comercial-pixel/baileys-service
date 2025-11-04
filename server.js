@@ -28,17 +28,30 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ----- Auth middleware (optional via JWT_SECRET) -----
 function requireAuth(req, res, next) {
-  if (!JWT_SECRET) return next(); // disabled if secret not set
-  const hdr = req.headers.authorization || "";
-  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "missing_token" });
+  if (!JWT_SECRET) return next(); // desabilita se não houver segredo definido
+
+  // tenta pegar o token do header, da query string ou do body
+  const authHeader = req.headers.authorization || "";
+  const tokenFromHeader = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : null;
+  const tokenFromQuery = req.query.token;
+  const tokenFromBody = req.body?.token;
+  const token = tokenFromHeader || tokenFromQuery || tokenFromBody;
+
+  if (!token) {
+    console.warn("[Auth] ❌ missing_token");
+    return res.status(401).json({ error: "missing_token" });
+  }
+
   try {
     jwt.verify(token, JWT_SECRET);
+    console.log("[Auth] ✅ Token verificado com sucesso");
     next();
   } catch (e) {
+    console.error("[Auth] ❌ invalid_token:", e.message);
     return res.status(401).json({ error: "invalid_token" });
   }
 }
+
 
 // ----- Baileys session manager -----
 const sessions = new Map(); // sessionId -> meta
