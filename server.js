@@ -60,57 +60,88 @@ function requireAuth(req, res, next) {
 }
 
 // ----------------- SESSÕES -----------------
-const sessions = new Map(); // sessionId -> meta
+// ===== Sessões e trava de inicialização =====
+const sessions = new Map();     // sessionId -> meta
+const sessionLocks = new Set(); // evita corrida ao criar a mesma sessão
 
 async function getOrCreateSession(sessionId) {
+  // já existe?
   if (sessions.has(sessionId)) return sessions.get(sessionId);
 
-  const authDir = path.join(DATA_DIR, sessionId);
-  fs.mkdirSync(authDir, { recursive: true });
+  // outra chamada já está criando?
+  while (sessionLocks.has(sessionId)) {
+    await new Promise(r => setTimeout(r, 150));
+  }
+  if (sessions.has(sessionId)) return sessions.get(sessionId);
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  // trava
+  sessionLocks.add(sessionId);
+  try {
+    const authDir = path.join(DATA_DIR, sessionId);
+    fs.mkdirSync(authDir, { recursive: true });
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion();
 
-  const meta = { sock, status: "starting", lastQr: null, connectedAt: null };
-  sessions.set(sessionId, meta);
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      logger: log,
+    });
 
-  sock.ev.on("creds.update", saveCreds);
-  sock.ev.on("connection.update", (u) => {
-    const { connection, lastDisconnect, qr } = u || {};
+    const meta = {
+      sock,
+      status: "starting",
+      lastQr: null,
+      lastQrDataUrl: null,
+      connectedAt: null,
+    };
+    sessions.set(sessionId, meta);
 
-    if (qr) {
-      meta.lastQr = qr;
-      meta.status = "qr";
-      log.info({ sessionId }, "QR updated");
-    }
-    if (connection === "open") {
-      meta.status = "connected";
-      meta.connectedAt = Date.now();
-      meta.lastQr = null;
-      log.info({ sessionId }, "Session connected");
-    }
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-      if (shouldReconnect) {
-        meta.status = "reconnecting";
-        log.warn({ sessionId, code }, "Reconnecting...");
-        setTimeout(() => getOrCreateSession(sessionId), 1500);
-      } else {
-        log.warn({ sessionId, code }, "Logged out, cleaning session");
-        sessions.delete(sessionId);
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", async (u) => {
+      const { connection, lastDisconnect, qr } = u || {};
+
+      if (qr) {
+        meta.lastQr = qr;
+        try {
+          // gera o PNG UMA VEZ por QR e guarda em memória
+          meta.lastQrDataUrl = await QRCode.toDataURL(qr);
+        } catch (e) {
+          log.error(e, "QR encode error");
+        }
+        meta.status = "waiting_for_scan";
       }
-    }
-  });
 
-  return meta;
+      if (connection === "open") {
+        meta.status = "connected";
+        meta.connectedAt = Date.now();
+        meta.lastQr = null;
+        meta.lastQrDataUrl = null;
+        log.info({ sessionId }, "Connected");
+      }
+
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        if (shouldReconnect) {
+          meta.status = "reconnecting";
+          setTimeout(() => getOrCreateSession(sessionId), 3000);
+        } else {
+          sessions.delete(sessionId);
+          log.warn({ sessionId }, "Logged out, session cleared");
+        }
+      }
+    });
+
+    return meta;
+  } finally {
+    sessionLocks.delete(sessionId);
+  }
 }
+
 
 // ----------------- HEALTH & INFO -----------------
 app.get("/healthz", (req, res) => res.json({ ok: true, t: Date.now() }));
@@ -125,39 +156,34 @@ app.get("/version", (req, res) => {
 });
 
 // ----------------- ROTAS PROTEGIDAS -----------------
-app.get("/sessions/:id/status", requireAuth, (req, res) => {
-  const meta = sessions.get(req.params.id);
+app.get("/sessions/:id/status", requireAuth, async (req, res) => {
+  const meta = await getOrCreateSession(req.params.id);
   res.json({
-    status: meta?.status ?? "not_initialized",
-    connectedAt: meta?.connectedAt ?? null,
+    status: meta.status,
+    connected: meta.status === "connected",
+    connectedAt: meta.connectedAt ?? null,
   });
 });
 
 app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
   const meta = await getOrCreateSession(req.params.id);
-  if (meta.status === "connected") return res.json({ status: "connected" });
-  if (!meta.lastQr) return res.status(202).json({ status: meta.status ?? "starting" });
-  const dataUrl = await QRCode.toDataURL(meta.lastQr);
-  res.json({ status: meta.status, dataUrl });
+
+  if (meta.status === "connected") {
+    return res.json({ status: "connected" });
+  }
+
+  if (!meta.lastQrDataUrl) {
+    // ainda não temos QR atual para mostrar
+    return res.status(202).json({ status: meta.status || "starting" });
+  }
+
+  // devolve sempre o MESMO dataURL até o Baileys emitir outro
+  res.json({
+    status: meta.status || "waiting_for_scan",
+    qr: meta.lastQrDataUrl,
+  });
 });
 
-app.post("/sessions/:id/messages", requireAuth, async (req, res) => {
-  const { to, text } = req.body || {};
-  const meta = sessions.get(req.params.id);
-  if (!meta || meta.status !== "connected")
-    return res.status(409).json({ error: "session_not_connected" });
-
-  const jid = `${String(to).replace(/\D/g, "")}@s.whatsapp.net`;
-  await meta.sock.sendMessage(jid, { text: text || "" });
-  res.json({ ok: true });
-});
-
-app.post("/sessions/:id/disconnect", requireAuth, async (req, res) => {
-  const meta = sessions.get(req.params.id);
-  if (meta?.sock) await meta.sock.logout();
-  sessions.delete(req.params.id);
-  res.json({ ok: true });
-});
 
 // ----------------- START -----------------
 app.listen(PORT, () => {
