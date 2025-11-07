@@ -96,38 +96,57 @@ async function getOrCreateSession(sessionId) {
     fs.mkdirSync(authDir, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
-    const { version } = await fetchLatestBaileysVersion();
+
+    // Busca versão do baileys com fallback
+    let version;
+    try {
+      ({ version } = await fetchLatestBaileysVersion());
+    } catch (e) {
+      log.warn({ sessionId, err: e?.message }, "fetchLatestBaileysVersion failed, using fallback");
+      // fallback razoável (ajuste se desejar)
+      version = [2, 2310, 10];
+    }
 
     const sock = makeWASocket({
       version,
       auth: state,
       printQRInTerminal: false,
-      logger: log, // integra logs do pino
+      logger: log,
+      // keepAliveIntervalMs: 30000, // opcional
     });
 
     const meta = {
       sock,
       status: "starting",
       lastQr: null,        // QR “puro” vindo do Baileys
-      lastQrDataUrl: null, // DataURL PNG cacheado (para não regenerar a cada GET)
+      lastQrDataUrl: null, // DataURL PNG cacheado
       connectedAt: null,
+      reconnectAttempts: 0,
     };
     sessions.set(sessionId, meta);
 
-    sock.ev.on("creds.update", saveCreds);
+    // Garantir persistência segura de credenciais
+    sock.ev.on("creds.update", async () => {
+      try {
+        await saveCreds();
+      } catch (e) {
+        log.error({ sessionId, err: e?.message }, "saveCreds failed");
+      }
+    });
 
-    sock.ev.on("connection.update", async (u) => {
-      const { connection, lastDisconnect, qr } = u || {};
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update || {};
 
       if (qr) {
         meta.lastQr = qr;
         try {
           meta.lastQrDataUrl = await QRCode.toDataURL(qr);
         } catch (e) {
-          log.error(e, "QR encode error");
+          log.error({ sessionId, err: e?.message }, "QR encode error");
           meta.lastQrDataUrl = null;
         }
         meta.status = "waiting_for_scan";
+        meta.reconnectAttempts = 0;
         log.info({ sessionId }, "QR updated");
       }
 
@@ -136,35 +155,57 @@ async function getOrCreateSession(sessionId) {
         meta.connectedAt = Date.now();
         meta.lastQr = null;
         meta.lastQrDataUrl = null;
+        meta.reconnectAttempts = 0;
         log.info({ sessionId }, "Session connected");
       }
 
       if (connection === "close") {
-        // Baileys fornece código HTTP em lastDisconnect?.error?.output?.statusCode
-        const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        const code = lastDisconnect?.error?.output?.statusCode ?? lastDisconnect?.error?.statusCode;
+        const errObj = lastDisconnect?.error;
+        log.warn({ sessionId, code, err: String(errObj?.message || errObj) }, "connection closed");
 
-        // WhatsApp expira o QR e lança "QR refs attempts ended"
-        if (lastDisconnect?.error) {
-          log.warn(
-            { sessionId, code, trace: String(lastDisconnect.error?.stack || lastDisconnect.error) },
-            "connection errored"
-          );
-        }
+        // Decide se reconectar
+        const shouldReconnect = code !== DisconnectReason.loggedOut &&
+                                code !== DisconnectReason.badSession &&
+                                code !== DisconnectReason.restartRequired;
 
-        if (shouldReconnect) {
-          meta.status = "reconnecting";
-          log.warn({ sessionId, code }, "Connection closed, reconnecting...");
-          setTimeout(() => {
-            // Ao reconectar, usamos o mesmo diretório/credenciais
-            getOrCreateSession(sessionId).catch((e) =>
-              log.error({ sessionId, err: e.message }, "reconnect failed")
-            );
-          }, 3000);
-        } else {
+        // Se for logout explícito ou bad session, limpamos
+        if (code === DisconnectReason.loggedOut || code === DisconnectReason.badSession) {
+          try { await sock.logout(); } catch {}
           sessions.delete(sessionId);
-          log.warn({ sessionId, code }, "Logged out, session cleared");
+          log.warn({ sessionId, code }, "Logged out or bad session, session cleared");
+          return;
         }
+
+        // Preparar reconexão controlada
+        meta.status = "reconnecting";
+        meta.reconnectAttempts = (meta.reconnectAttempts || 0) + 1;
+        const backoff = Math.min(30000, 2000 * meta.reconnectAttempts);
+        log.info({ sessionId, attempt: meta.reconnectAttempts, backoff }, "scheduling reconnect");
+
+        // cleanup da instância antiga: remove listeners e fecha conexões subjacentes
+        try {
+          sock.ev.removeAllListeners();
+        } catch (e) {
+          log.debug({ sessionId, err: e?.message }, "removeAllListeners failed");
+        }
+        try {
+          // Alguns sockets expõem end/close/ws; usamos try/catch para tolerância
+          if (typeof sock.end === "function") sock.end();
+          if (sock.ws && typeof sock.ws.close === "function") sock.ws.close();
+        } catch (e) {
+          log.debug({ sessionId, err: e?.message }, "socket close/end failed");
+        }
+
+        // Delay antes de recriar; garanta que a sessão antiga foi removida do mapa
+        setTimeout(async () => {
+          sessions.delete(sessionId);
+          try {
+            await getOrCreateSession(sessionId);
+          } catch (e) {
+            log.error({ sessionId, err: e?.message }, "reconnect failed");
+          }
+        }, backoff);
       }
     });
 
@@ -199,7 +240,6 @@ app.get("/sessions/:id/status", requireAuth, async (req, res) => {
     status: meta.status,
     connected: meta.status === "connected",
     connectedAt: meta.connectedAt ?? null,
-    // dica para o front: só busque /qr se status === "waiting_for_scan"
     hint: meta.status === "waiting_for_scan" ? "call /qr" : "no-qr",
   });
 });
@@ -211,13 +251,10 @@ app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
     return res.json({ status: "connected" });
   }
 
-  // Ainda inicializando ou sem QR atual em cache
   if (!meta.lastQrDataUrl) {
     return res.status(202).json({ status: meta.status || "starting" });
   }
 
-  // Devolvemos SEMPRE o MESMO dataURL enquanto o Baileys não emitir outro QR
-  // Se quiser forçar rotação manual, implemente no front um POST /reset (abaixo)
   return res.json({
     status: meta.status || "waiting_for_scan",
     qr: meta.lastQrDataUrl,
@@ -232,9 +269,7 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
     if (meta?.sock) {
       try {
         await meta.sock.logout();
-      } catch {
-        // ignora erro de logout
-      }
+      } catch {}
     }
     sessions.delete(sessionId);
 
@@ -242,17 +277,15 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
     const authDir = path.join(DATA_DIR, sessionId);
     try {
       fs.rmSync(authDir, { recursive: true, force: true });
-    } catch {
-      // ignora se já não existir
-    }
+    } catch {}
 
     // Reabre a sessão do zero
     await sleep(300);
     const fresh = await getOrCreateSession(sessionId);
     return res.json({ ok: true, status: fresh.status || "starting" });
   } catch (e) {
-    log.error(e, "reset error");
-    return res.status(500).json({ ok: false, error: e.message });
+    log.error({ err: e?.message }, "reset error");
+    return res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
