@@ -1,4 +1,8 @@
-// server.js — Baileys API (ESM) com persistência e tratamento de device_removed
+// server.js — Baileys API (ESM) com:
+// - QR “congelado” quando conecta (não regera à toa)
+// - Notificação automática via WhatsApp do estado da sessão
+// - Keep-alive, fila de notificações e endpoint de envio de mensagens
+// - /health (além de /healthz)
 
 import express from "express";
 import QRCode from "qrcode";
@@ -9,14 +13,13 @@ import {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
-// ----------------------------------------------------
-// CONFIG BÁSICA
-// ----------------------------------------------------
+// ---------------------- CONFIG ----------------------
 const app = express();
 app.use(express.json());
 
@@ -24,59 +27,101 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization"
+  );
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = process.env.DATA_DIR || "/data"; // monte um Disk no Render em /data
-const JWT_SECRET = process.env.JWT_SECRET || "";  // se vazio, autenticação desabilitada
+const DATA_DIR = process.env.DATA_DIR || "/data";
 
-// Suporte __dirname em ESM
+// se vazio, auth desabilitada
+const JWT_SECRET = process.env.JWT_SECRET || "";
+
+// E.164 para receber alertas de status (ex.: +5519999999999)
+// se não setar, só loga no console
+const ADMIN_NOTIFY_TO = process.env.ADMIN_NOTIFY_TO || "";
+
+// throttling de QR para UI (ms)
+const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 1200);
+
+// ping periódico para manter sessão ativa (ms)
+const KEEPALIVE_MS = Number(process.env.KEEPALIVE_MS || 30000);
+
+// ----------------------------------------------
+// __dirname (ESM)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Garante diretório persistente
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ----------------------------------------------------
-// AUTENTICAÇÃO (JWT no header Authorization, ?token= ou body.token)
-// ----------------------------------------------------
+// ---------------------- AUTH ----------------------
 function requireAuth(req, res, next) {
-  if (!JWT_SECRET) return next(); // auth desabilitada
-
+  if (!JWT_SECRET) return next();
   const authHeader = req.headers.authorization || "";
   const tokenFromHeader = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7).trim()
     : null;
-
   const token = tokenFromHeader || req.query?.token || req.body?.token;
-  if (!token) {
-    log.warn({ path: req.path }, "[Auth] missing_token");
-    return res.status(401).json({ error: "missing_token" });
-  }
+  if (!token) return res.status(401).json({ error: "missing_token" });
   try {
     jwt.verify(token, JWT_SECRET);
     next();
   } catch (e) {
-    log.warn({ path: req.path, err: e.message }, "[Auth] invalid_token");
     return res.status(401).json({ error: "invalid_token" });
   }
 }
 
-// ----------------------------------------------------
-// GERENCIAMENTO DE SESSÕES
-// ----------------------------------------------------
-const sessions = new Map();     // sessionId -> meta
-const sessionLocks = new Set(); // evita corrida na criação
+// ------------------ STATE DE SESSÕES ----------------
+const sessions = new Map();     // id -> meta
+const sessionLocks = new Set();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+async function notifyAdmin(meta, text) {
+  try {
+    meta.pendingNotices = meta.pendingNotices || [];
+    if (!ADMIN_NOTIFY_TO) {
+      log.info({ sessionId: meta.id, text }, "[notify] (sem ADMIN_NOTIFY_TO)");
+      return;
+    }
+    // se não está conectado, enfileira
+    if (meta.status !== "connected") {
+      meta.pendingNotices.push(text);
+      return;
+    }
+    await meta.sock.sendMessage(jidNormalizedUser(ADMIN_NOTIFY_TO), {
+      text,
+    });
+  } catch (e) {
+    log.warn({ sessionId: meta.id, err: e?.message }, "notify failed; enqueue");
+    (meta.pendingNotices = meta.pendingNotices || []).push(text);
+  }
+}
+
+async function flushNotices(meta) {
+  if (!ADMIN_NOTIFY_TO || !meta?.sock) return;
+  if (!meta?.pendingNotices || !meta.pendingNotices.length) return;
+  if (meta.status !== "connected") return;
+  const to = jidNormalizedUser(ADMIN_NOTIFY_TO);
+  for (const msg of meta.pendingNotices.splice(0)) {
+    try {
+      await meta.sock.sendMessage(to, { text: msg });
+    } catch (e) {
+      // se falhar, re-enfileira e para
+      meta.pendingNotices.unshift(msg);
+      break;
+    }
+  }
+}
+
 async function getOrCreateSession(sessionId) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
-  while (sessionLocks.has(sessionId)) await sleep(120);
+
+  while (sessionLocks.has(sessionId)) await sleep(150);
   if (sessions.has(sessionId)) return sessions.get(sessionId);
 
   sessionLocks.add(sessionId);
@@ -86,13 +131,12 @@ async function getOrCreateSession(sessionId) {
 
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    // versão do WA Web
+    // versão
     let version;
     try {
       ({ version } = await fetchLatestBaileysVersion());
-    } catch (e) {
-      log.warn({ sessionId, err: e?.message }, "fetchLatestBaileysVersion failed, fallback");
-      version = [2, 3000, 1027934701]; // fallback
+    } catch {
+      version = [2, 2310, 10];
     }
 
     const sock = makeWASocket({
@@ -102,103 +146,116 @@ async function getOrCreateSession(sessionId) {
       logger: log,
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      connectTimeoutMs: 60_000,
-      keepAliveIntervalMs: 15_000,
+      // ajuda a manter o socket “vivo”
+      keepAliveIntervalMs: KEEPALIVE_MS,
+      browser: ["Ubuntu", "Chrome", "22.04.4"],
     });
 
     const meta = {
+      id: sessionId,
       sock,
       status: "starting",
-      lastQrText: null,        // QR como texto
-      lastQrDataUrl: null,     // QR como dataURL png (para frontend)
+      lastQr: null,
+      lastQrDataUrl: null,
+      lastQrAt: 0,
       connectedAt: null,
       reconnectAttempts: 0,
+      pendingNotices: [],
+      keepaliveTimer: null,
     };
     sessions.set(sessionId, meta);
 
-    // persistência de credenciais
+    // persistir credenciais
     sock.ev.on("creds.update", async () => {
-      try { await saveCreds(); } catch (e) {
+      try {
+        await saveCreds();
+      } catch (e) {
         log.error({ sessionId, err: e?.message }, "saveCreds failed");
       }
     });
 
-    // eventos de conexão
+    // keepalive “extra”: ping via presence (opcional)
+    const startKeepAlive = () => {
+      if (meta.keepaliveTimer) clearInterval(meta.keepaliveTimer);
+      meta.keepaliveTimer = setInterval(async () => {
+        try {
+          if (meta.status === "connected") {
+            await sock.presenceSubscribe(sock?.user?.id || "status@broadcast").catch(() => {});
+          }
+        } catch {}
+      }, KEEPALIVE_MS);
+    };
+    startKeepAlive();
+
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update || {};
 
-      if (qr) {
-        meta.lastQrText = qr;
-        try {
-          meta.lastQrDataUrl = await QRCode.toDataURL(qr);
-        } catch (e) {
-          meta.lastQrDataUrl = null;
-          log.error({ sessionId, err: e?.message }, "QR encode error");
+      // QR: só atualiza se AINDA NÃO estiver conectado e com throttle
+      if (qr && meta.status !== "connected") {
+        const now = Date.now();
+        if (now - meta.lastQrAt >= QR_THROTTLE_MS) {
+          meta.lastQrAt = now;
+          meta.lastQr = qr;
+          try {
+            meta.lastQrDataUrl = await QRCode.toDataURL(qr);
+          } catch (e) {
+            log.error({ sessionId, err: e?.message }, "QR encode error");
+            meta.lastQrDataUrl = null;
+          }
+          meta.status = "waiting_for_scan";
+          meta.reconnectAttempts = 0;
+          log.info({ sessionId }, "QR updated");
+          await notifyAdmin(meta, `🟡 [${sessionId}] Aguardando scan do QR code.`);
         }
-        meta.status = "waiting_for_scan";
-        meta.reconnectAttempts = 0;
-        log.info({ sessionId }, "QR updated");
       }
 
       if (connection === "open") {
         meta.status = "connected";
         meta.connectedAt = Date.now();
-        meta.lastQrText = null;
+        meta.lastQr = null;
         meta.lastQrDataUrl = null;
         meta.reconnectAttempts = 0;
+
         log.info({ sessionId }, "Session connected");
+        await notifyAdmin(
+          meta,
+          `🟢 [${sessionId}] Conectado como ${sock?.user?.name || "bot"} (${sock?.user?.id || "?"}).`
+        );
+        await flushNotices(meta);
       }
 
       if (connection === "close") {
-        // status/erro
-        const errObj = lastDisconnect?.error;
         const code =
-          errObj?.output?.statusCode ??
-          errObj?.statusCode ??
-          errObj?.data?.statusCode ??
-          errObj?.cause?.statusCode;
+          lastDisconnect?.error?.output?.statusCode ??
+          lastDisconnect?.error?.statusCode ??
+          lastDisconnect?.statusCode;
+        const errObj = lastDisconnect?.error;
+        log.warn(
+          { sessionId, code, err: String(errObj?.message || errObj) },
+          "connection closed"
+        );
 
-        const raw = JSON.stringify(errObj ?? {});
-        const isRestartRequired =
-          code === DisconnectReason.restartRequired || String(errObj?.message || "").toLowerCase().includes("restart required") || code === 515;
-
-        const isConflictDeviceRemoved =
-          (code === 401 && (raw.includes("device_removed") || raw.toLowerCase().includes("conflict"))) ||
-          String(errObj?.message || "").toLowerCase().includes("device_removed");
-
-        const isLoggedOut =
-          code === DisconnectReason.loggedOut || code === DisconnectReason.badSession || (code === 401 && !isRestartRequired);
-
-        log.warn({ sessionId, code, msg: String(errObj?.message || errObj) }, "connection closed");
-
-        // 1) Conflito / device_removed → apaga sessão e pede novo QR
-        if (isConflictDeviceRemoved) {
-          try { await sock.logout?.(); } catch {}
-          try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
+        // mensagens específicas
+        if (code === DisconnectReason.loggedOut || code === 401) {
+          await notifyAdmin(meta, `🔴 [${sessionId}] Sessão removida pelo WhatsApp (loggedOut/device_removed). Gere novo QR.`);
+          try { await sock.logout(); } catch {}
           sessions.delete(sessionId);
-          log.warn({ sessionId }, "Sessão removida pelo WhatsApp (device_removed). Gere um novo QR.");
-          return; // cliente deve chamar /qr para novo pareamento
-        }
-
-        // 2) Logout/badSession → apaga sessão e pede novo QR
-        if (isLoggedOut) {
-          try { await sock.logout?.(); } catch {}
-          try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
-          sessions.delete(sessionId);
-          log.warn({ sessionId, code }, "Logged out/bad session. Gere um novo QR.");
           return;
         }
+        if (code === DisconnectReason.restartRequired || code === 515) {
+          // 515 é esperado após pairing; reconectar
+          await notifyAdmin(meta, `🟠 [${sessionId}] Reinício do socket (restartRequired/515).`);
+        }
 
-        // 3) 515 restart required → reconexão controlada
-        meta.status = "reconnecting";
-        meta.reconnectAttempts = (meta.reconnectAttempts || 0) + 1;
-        const backoff = isRestartRequired ? 1500 : Math.min(30000, 2000 * meta.reconnectAttempts);
-        log.info({ sessionId, attempt: meta.reconnectAttempts, backoff }, "scheduling reconnect");
-
-        // encerra instância antiga
+        // cleanup
         try { sock.ev.removeAllListeners(); } catch {}
         try { if (typeof sock.end === "function") sock.end(); } catch {}
         try { if (sock.ws && typeof sock.ws.close === "function") sock.ws.close(); } catch {}
+
+        meta.status = "reconnecting";
+        meta.reconnectAttempts = (meta.reconnectAttempts || 0) + 1;
+        const backoff = Math.min(30000, 2000 * meta.reconnectAttempts);
+        log.info({ sessionId, attempt: meta.reconnectAttempts, backoff }, "scheduling reconnect");
 
         setTimeout(async () => {
           sessions.delete(sessionId);
@@ -211,43 +268,36 @@ async function getOrCreateSession(sessionId) {
       }
     });
 
-    // (opcional) log mínimo de mensagens recebidas
-    sock.ev.on("messages.upsert", (m) => {
-      const msg = m?.messages?.[0];
-      if (!msg || msg.key.fromMe) return;
-      log.info({ from: msg.key.remoteJid, type: Object.keys(msg.message || {})[0] }, "message.in");
-    });
-
     return meta;
   } finally {
     sessionLocks.delete(sessionId);
   }
 }
 
-// ----------------------------------------------------
-// HEALTH / INFO
-// ----------------------------------------------------
-app.get("/", (_req, res) => res.send("Baileys service up"));
+// ------------------ HEALTH / INFO -------------------
+app.get("/", (_req, res) => res.json({ ok: true, service: "baileys-api" }));
 app.get("/healthz", (_req, res) => res.json({ ok: true, t: Date.now() }));
+app.get("/health", (_req, res) => res.json({ ok: true, t: Date.now() }));
+
 app.get("/version", (_req, res) => {
   res.json({
     ok: true,
     port: PORT,
     dataDir: DATA_DIR,
     auth: Boolean(JWT_SECRET),
-    note: "Se auth=true, o token pode vir via header Authorization, query ?token= ou body.token",
+    adminNotifyTo: ADMIN_NOTIFY_TO || null,
   });
 });
 
-// ----------------------------------------------------
-// ROTAS PROTEGIDAS (status, qr, reset, send)
-// ----------------------------------------------------
+// ------------------- ROTAS PROTEGIDAS ----------------
 app.get("/sessions/:id/status", requireAuth, async (req, res) => {
   const meta = await getOrCreateSession(req.params.id);
   res.json({
+    sessionId: meta.id,
     status: meta.status,
     connected: meta.status === "connected",
     connectedAt: meta.connectedAt ?? null,
+    user: meta.sock?.user || null,
     hint: meta.status === "waiting_for_scan" ? "call /qr" : "no-qr",
   });
 });
@@ -255,40 +305,37 @@ app.get("/sessions/:id/status", requireAuth, async (req, res) => {
 app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
   const meta = await getOrCreateSession(req.params.id);
   if (meta.status === "connected") return res.json({ status: "connected" });
-  if (!meta.lastQrDataUrl) return res.status(202).json({ status: meta.status || "starting" }); // ainda sem QR
-  return res.json({ status: meta.status || "waiting_for_scan", qr: meta.lastQrDataUrl });
+  if (!meta.lastQrDataUrl)
+    return res.status(202).json({ status: meta.status || "starting" });
+
+  return res.json({
+    status: meta.status || "waiting_for_scan",
+    qr: meta.lastQrDataUrl,
+  });
 });
 
-// Enviar mensagem
+// enviar mensagem
 app.post("/sessions/:id/send", requireAuth, async (req, res) => {
-  try {
-    const { to, text } = req.body || {};
-    if (!to || !text) return res.status(400).json({ ok: false, error: "Campos 'to' e 'text' são obrigatórios" });
-    const meta = await getOrCreateSession(req.params.id);
-    if (meta.status !== "connected") return res.status(409).json({ ok: false, error: "not_connected" });
+  const meta = await getOrCreateSession(req.params.id);
+  const { to, text } = req.body || {};
+  if (!to || !text) return res.status(400).json({ error: "to and text are required" });
+  if (meta.status !== "connected") return res.status(409).json({ error: "not_connected" });
 
-    // normaliza JID
-    const jid = /@s\.whatsapp\.net$|@g\.us$/.test(to) ? to : `${String(to).replace(/[^\d]/g, "")}@s.whatsapp.net`;
+  try {
+    const jid = jidNormalizedUser(to);
     const r = await meta.sock.sendMessage(jid, { text });
     return res.json({ ok: true, id: r?.key?.id || null });
   } catch (e) {
-    log.error({ err: e?.message }, "send error");
-    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    return res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
-// Alias legado: /messages -> /send (evita 404 HTML no front)
-app.post("/sessions/:id/messages", requireAuth, (req, res) => {
-  req.url = `/sessions/${req.params.id}/send`;
-  app._router.handle(req, res);
-});
-
-// Reset manual (apaga credenciais e recomeça)
+// reset total (apaga credenciais)
 app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
   const sessionId = req.params.id;
   try {
     const meta = sessions.get(sessionId);
-    if (meta?.sock) { try { await meta.sock.logout(); } catch {} }
+    if (meta?.sock) try { await meta.sock.logout(); } catch {}
     sessions.delete(sessionId);
     const authDir = path.join(DATA_DIR, sessionId);
     try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
@@ -296,24 +343,20 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
     const fresh = await getOrCreateSession(sessionId);
     return res.json({ ok: true, status: fresh.status || "starting" });
   } catch (e) {
-    log.error({ err: e?.message }, "reset error");
     return res.status(500).json({ ok: false, error: e?.message });
   }
 });
 
-// Desconectar sem apagar credenciais
+// desconectar sem apagar credenciais
 app.post("/sessions/:id/disconnect", requireAuth, async (req, res) => {
   const sessionId = req.params.id;
   const meta = sessions.get(sessionId);
-  if (meta?.sock) { try { await meta.sock.logout(); } catch {} }
+  if (meta?.sock) try { await meta.sock.logout(); } catch {}
   sessions.delete(sessionId);
   return res.json({ ok: true });
 });
 
-// 404 JSON (evita “Unexpected token '<' …” no front)
-app.use((req, res) => res.status(404).json({ ok: false, error: "Not Found", path: req.originalUrl }));
-
-// START
+// ---------------------- START -----------------------
 app.listen(PORT, () => {
   log.info(`Baileys API listening on :${PORT}`);
 });
