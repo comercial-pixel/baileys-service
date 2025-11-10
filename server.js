@@ -87,4 +87,251 @@ async function notifyAdmin(meta, text) {
 
 async function flushNotices(meta) {
   if (!ADMIN_NOTIFY_TO || !meta?.sock) return;
-  if (!meta?.pendingNotices?.length || meta.status !== "connected") return
+  if (!meta?.pendingNotices?.length || meta.status !== "connected") return;
+  const to = jidNormalizedUser(ADMIN_NOTIFY_TO);
+  for (const msg of meta.pendingNotices.splice(0)) {
+    try {
+      await meta.sock.sendMessage(to, { text: msg });
+    } catch {
+      meta.pendingNotices.unshift(msg);
+      break;
+    }
+  }
+}
+
+async function getOrCreateSession(sessionId) {
+  if (sessions.has(sessionId)) return sessions.get(sessionId);
+  while (sessionLocks.has(sessionId)) await sleep(150);
+  if (sessions.has(sessionId)) return sessions.get(sessionId);
+  sessionLocks.add(sessionId);
+
+  try {
+    const authDir = path.join(DATA_DIR, sessionId);
+    fs.mkdirSync(authDir, { recursive: true });
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    let version;
+    try {
+      ({ version } = await fetchLatestBaileysVersion());
+    } catch {
+      version = [2, 2310, 10];
+    }
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      logger: log,
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      keepAliveIntervalMs: KEEPALIVE_MS,
+      browser: ["Ubuntu", "Chrome", "22.04.4"],
+    });
+
+    const meta = {
+      id: sessionId,
+      sock,
+      status: "starting",
+      lastQr: null,
+      lastQrDataUrl: null,
+      lastQrAt: 0,
+      connectedAt: null,
+      reconnectAttempts: 0,
+      pendingNotices: [],
+      keepaliveTimer: null,
+    };
+    sessions.set(sessionId, meta);
+
+    sock.ev.on("creds.update", async () => {
+      try { await saveCreds(); } catch (e) {
+        log.error({ sessionId, err: e?.message }, "saveCreds failed");
+      }
+    });
+
+    // keepalive extra
+    const startKeepAlive = () => {
+      if (meta.keepaliveTimer) clearInterval(meta.keepaliveTimer);
+      meta.keepaliveTimer = setInterval(async () => {
+        try {
+          if (meta.status === "connected") {
+            await sock.presenceSubscribe(sock?.user?.id || "status@broadcast").catch(() => {});
+          }
+        } catch {}
+      }, KEEPALIVE_MS);
+    };
+    startKeepAlive();
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update || {};
+
+      if (qr && meta.status !== "connected") {
+        const now = Date.now();
+        if (now - meta.lastQrAt >= QR_THROTTLE_MS) {
+          meta.lastQrAt = now;
+          meta.lastQr = qr;
+          try {
+            meta.lastQrDataUrl = await QRCode.toDataURL(qr);
+          } catch {
+            meta.lastQrDataUrl = null;
+          }
+          meta.status = "waiting_for_scan";
+          meta.reconnectAttempts = 0;
+          log.info({ sessionId }, "QR updated");
+          await notifyAdmin(meta, `🟡 [${sessionId}] Aguardando scan do QR code.`);
+        }
+      }
+
+      if (connection === "open") {
+        meta.status = "connected";
+        meta.connectedAt = Date.now();
+        meta.lastQr = null;
+        meta.lastQrDataUrl = null;
+        meta.reconnectAttempts = 0;
+        log.info({ sessionId }, "Session connected");
+        await notifyAdmin(meta, `🟢 [${sessionId}] Conectado como ${sock?.user?.name || "bot"} (${sock?.user?.id || "?"}).`);
+        await flushNotices(meta);
+      }
+
+      if (connection === "close") {
+        const code =
+          lastDisconnect?.error?.output?.statusCode ??
+          lastDisconnect?.error?.statusCode ??
+          lastDisconnect?.statusCode;
+        const errObj = lastDisconnect?.error;
+        log.warn({ sessionId, code, reason: DisconnectReason[code], err: String(errObj?.message || errObj) }, "connection closed");
+
+        if (code === DisconnectReason.loggedOut || code === 401) {
+          await notifyAdmin(meta, `🔴 [${sessionId}] Sessão removida pelo WhatsApp (loggedOut/device_removed). Gere novo QR.`);
+          try { await sock.logout(); } catch {}
+          sessions.delete(sessionId);
+          return;
+        }
+        if (code === DisconnectReason.restartRequired || code === 515) {
+          await notifyAdmin(meta, `🟠 [${sessionId}] Reinício do socket (restartRequired/515).`);
+        }
+
+        try { sock.ev.removeAllListeners(); } catch {}
+        try { if (typeof sock.end === "function") sock.end(); } catch {}
+        try { if (sock.ws && typeof sock.ws.close === "function") sock.ws.close(); } catch {}
+
+        meta.status = "reconnecting";
+        meta.reconnectAttempts = (meta.reconnectAttempts || 0) + 1;
+        const backoff = Math.min(30000, 2000 * meta.reconnectAttempts);
+        log.info({ sessionId, attempt: meta.reconnectAttempts, backoff }, "scheduling reconnect");
+
+        setTimeout(async () => {
+          sessions.delete(sessionId);
+          try { await getOrCreateSession(sessionId); } catch (e) {
+            log.error({ sessionId, err: e?.message }, "reconnect failed");
+          }
+        }, backoff);
+      }
+    });
+
+    return meta;
+  } finally {
+    sessionLocks.delete(sessionId);
+  }
+}
+
+// ------------------ HEALTH / INFO -------------------
+app.get("/", (_req, res) => res.json({ ok: true, service: "baileys-api" }));
+app.get("/healthz", (_req, res) => res.json({ ok: true, t: Date.now() }));
+app.get("/health", (_req, res) => res.json({ ok: true, t: Date.now() }));
+
+app.get("/version", (_req, res) => {
+  res.json({
+    ok: true,
+    port: PORT,
+    dataDir: DATA_DIR,
+    auth: Boolean(JWT_SECRET),
+    adminNotifyTo: ADMIN_NOTIFY_TO || null,
+  });
+});
+
+// ------------------- ROTAS PROTEGIDAS ----------------
+app.get("/sessions/:id/status", requireAuth, async (req, res) => {
+  const meta = await getOrCreateSession(req.params.id);
+  res.json({
+    sessionId: meta.id,
+    status: meta.status,
+    connected: meta.status === "connected",
+    connectedAt: meta.connectedAt ?? null,
+    user: meta.sock?.user || null,
+    hint: meta.status === "waiting_for_scan" ? "call /qr" : "no-qr",
+  });
+});
+
+app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
+  const meta = await getOrCreateSession(req.params.id);
+  if (meta.status === "connected") return res.json({ status: "connected" });
+  if (!meta.lastQrDataUrl)
+    return res.status(202).json({ status: meta.status || "starting" });
+
+  return res.json({
+    status: meta.status || "waiting_for_scan",
+    qr: meta.lastQrDataUrl,
+  });
+});
+
+// enviar mensagem principal
+app.post("/sessions/:id/send", requireAuth, async (req, res) => {
+  const meta = await getOrCreateSession(req.params.id);
+  const { to, text } = req.body || {};
+  if (!to || !text)
+    return res.status(400).json({ error: "to and text are required" });
+  if (meta.status !== "connected")
+    return res.status(409).json({ error: "not_connected" });
+
+  try {
+    const jid = jidNormalizedUser(to);
+    const r = await meta.sock.sendMessage(jid, { text });
+    return res.json({ ok: true, id: r?.key?.id || null });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+// alias /messages → usa a rota /send
+app.post("/sessions/:id/messages", requireAuth, async (req, res) => {
+  req.url = req.url.replace("/messages", "/send");
+  return app._router.handle(req, res);
+});
+
+// reset total (apaga credenciais)
+app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    const meta = sessions.get(sessionId);
+    if (meta?.sock) try { await meta.sock.logout(); } catch {}
+    sessions.delete(sessionId);
+    const authDir = path.join(DATA_DIR, sessionId);
+    try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
+    await sleep(300);
+    const fresh = await getOrCreateSession(sessionId);
+    return res.json({ ok: true, status: fresh.status || "starting" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+// desconectar sem apagar credenciais
+app.post("/sessions/:id/disconnect", requireAuth, async (req, res) => {
+  const sessionId = req.params.id;
+  const meta = sessions.get(sessionId);
+  if (meta?.sock) try { await meta.sock.logout(); } catch {}
+  sessions.delete(sessionId);
+  return res.json({ ok: true });
+});
+
+// log 404
+app.use((req, res) => {
+  log.warn({ method: req.method, url: req.originalUrl }, "route_not_found_404");
+  res.status(404).json({ ok: false, error: "not_found" });
+});
+
+// ---------------------- START -----------------------
+app.listen(PORT, () => {
+  log.info(`Baileys API listening on :${PORT}`);
+});
+
