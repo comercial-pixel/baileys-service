@@ -19,7 +19,7 @@ import { fileURLToPath } from "url";
 const app = express();
 app.use(express.json());
 
-// CORS básico
+// CORS simples
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -32,7 +32,7 @@ const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const JWT_SECRET = process.env.JWT_SECRET || ""; // se vazio, auth off
-const ADMIN_NOTIFY_TO = process.env.ADMIN_NOTIFY_TO || ""; // E.164
+const ADMIN_NOTIFY_TO = process.env.ADMIN_NOTIFY_TO || ""; // E.164 (+55...)
 const QR_THROTTLE_MS = Number(process.env.QR_THROTTLE_MS || 1200);
 const KEEPALIVE_MS = Number(process.env.KEEPALIVE_MS || 30000);
 
@@ -43,7 +43,7 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------------------- AUTH ----------------------
 function requireAuth(req, res, next) {
-  if (!JWT_SECRET) return next();
+  if (!JWT_SECRET) return next(); // auth desabilitada
   const authHeader = req.headers.authorization || "";
   const tokenFromHeader = authHeader.startsWith("Bearer ")
     ? authHeader.slice(7).trim()
@@ -62,20 +62,18 @@ function requireAuth(req, res, next) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function extractNumberFromJid(jid) {
-  // ex.: "5511999999999@s.whatsapp.net" -> "5511999999999"
   const m = (jid || "").match(/^(\d{6,})@/);
   return m ? m[1] : null;
 }
 
 function toE164Digits(input) {
-  // aceita "+55 11 999...", "5511999...", "55-11-999..."
   if (!input) return null;
   const digits = String(input).replace(/[^\d]/g, "");
-  return digits.length >= 6 ? digits : null;
+  return digits.length >= 10 && digits.length <= 15 ? digits : null;
 }
 
 // ------------------ STATE DE SESSÕES ----------------
-const sessions = new Map(); // id -> meta
+const sessions = new Map();     // id -> meta
 const sessionLocks = new Set();
 
 async function notifyAdmin(meta, text) {
@@ -153,23 +151,20 @@ async function getOrCreateSession(sessionId) {
     };
     sessions.set(sessionId, meta);
 
+    // persistir credenciais
     sock.ev.on("creds.update", async () => {
-      try {
-        await saveCreds();
-      } catch (e) {
+      try { await saveCreds(); } catch (e) {
         log.error({ sessionId, err: e?.message }, "saveCreds failed");
       }
     });
 
-    // keepalive adicional via presence
+    // keepalive adicional via presence (opcional)
     const startKeepAlive = () => {
       if (meta.keepaliveTimer) clearInterval(meta.keepaliveTimer);
       meta.keepaliveTimer = setInterval(async () => {
         try {
           if (meta.status === "connected") {
-            await sock
-              .presenceSubscribe(sock?.user?.id || "status@broadcast")
-              .catch(() => {});
+            await sock.presenceSubscribe(sock?.user?.id || "status@broadcast").catch(() => {});
           }
         } catch {}
       }, KEEPALIVE_MS);
@@ -215,18 +210,24 @@ async function getOrCreateSession(sessionId) {
           lastDisconnect?.error?.statusCode ??
           lastDisconnect?.statusCode;
         const errObj = lastDisconnect?.error;
-        log.warn(
-            { sessionId, code, err: String(errObj?.message || errObj) },
-            "connection closed"
-        );
+        log.warn({ sessionId, code, err: String(errObj?.message || errObj) }, "connection closed");
 
+        // 🔴 credenciais inválidas/expiradas => limpar state e recriar para emitir QR
         if (code === DisconnectReason.loggedOut || code === 401) {
-          await notifyAdmin(
-            meta,
-            `🔴 [${sessionId}] Sessão removida (device_removed/loggedOut). Gere novo QR.`
-          );
+          await notifyAdmin(meta, `🔴 [${sessionId}] Sessão removida (device_removed/loggedOut). Gerando novo QR...`);
           try { await sock.logout(); } catch {}
+          try { sock.ev.removeAllListeners(); } catch {}
+          try { sock.end?.(); } catch {}
+          try { sock.ws?.close?.(); } catch {}
+
           sessions.delete(sessionId);
+          const authDirDel = path.join(DATA_DIR, sessionId);
+          try { fs.rmSync(authDirDel, { recursive: true, force: true }); } catch {}
+
+          setTimeout(async () => {
+            try { await getOrCreateSession(sessionId); }
+            catch (e) { log.error({ sessionId, err: e?.message }, "recreate_after_loggedOut_failed"); }
+          }, 300);
           return;
         }
 
@@ -245,11 +246,8 @@ async function getOrCreateSession(sessionId) {
 
         setTimeout(async () => {
           sessions.delete(sessionId);
-          try {
-            await getOrCreateSession(sessionId);
-          } catch (e) {
-            log.error({ sessionId, err: e?.message }, "reconnect failed");
-          }
+          try { await getOrCreateSession(sessionId); }
+          catch (e) { log.error({ sessionId, err: e?.message }, "reconnect failed"); }
         }, backoff);
       }
     });
@@ -285,7 +283,7 @@ app.get("/sessions/:id/status", requireAuth, async (req, res) => {
     connected: meta.status === "connected",
     connectedAt: meta.connectedAt ?? null,
     userJid,
-    userNumber: extractNumberFromJid(userJid), // <- front usa esse campo!
+    userNumber: extractNumberFromJid(userJid), // <- front usa esse campo
     hint: meta.status === "waiting_for_scan" ? "call /qr" : "no-qr",
   });
 });
@@ -298,13 +296,10 @@ app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
 });
 
 // ------- ENVIO: aceita {to,text} ou {number,message} -------
-async function sendMessageHandler(req, res) {
+app.post("/sessions/:id/send", requireAuth, async (req, res) => {
   const meta = await getOrCreateSession(req.params.id);
-  if (meta.status !== "connected") {
-    return res.status(409).json({ error: "not_connected" });
-  }
+  if (meta.status !== "connected") return res.status(409).json({ error: "not_connected" });
 
-  // compatibilidade:
   const toRaw = req.body?.to ?? req.body?.number;
   const text = req.body?.text ?? req.body?.message;
 
@@ -312,26 +307,26 @@ async function sendMessageHandler(req, res) {
     return res.status(400).json({ error: "to/number and text/message are required" });
   }
 
-  // número destino (E.164) -> JID
   const digits = toE164Digits(toRaw);
   if (!digits) return res.status(400).json({ error: "invalid_phone" });
 
   try {
-    const jid = jidNormalizedUser(digits); // evita jidDecode()
-    const r = await meta.sock.sendMessage(jid, { text: String(text) });
+    const jid = jidNormalizedUser(digits);
+    const r = await meta.sock.sendMessage(jid, { text });
     return res.json({ ok: true, id: r?.key?.id || null, to: digits });
   } catch (e) {
-    log.error({ sessionId: meta.id, err: e?.message }, "send_error");
-    return res.status(500).json({ ok: false, error: e?.message || "send_failed" });
+    log.error({ err: e?.message }, "send_error");
+    return res.status(500).json({ ok: false, error: e?.message });
   }
-}
-
-app.post("/sessions/:id/send", requireAuth, sendMessageHandler);
+});
 
 // alias compatível: /messages (front antigo)
-app.post("/sessions/:id/messages", requireAuth, sendMessageHandler);
+app.post("/sessions/:id/messages", requireAuth, async (req, res) => {
+  req.url = req.url.replace("/messages", "/send");
+  return app._router.handle(req, res);
+});
 
-// reset total (apaga credenciais)
+// reset total (apaga credenciais e recria)
 app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
   const sessionId = req.params.id;
   try {
