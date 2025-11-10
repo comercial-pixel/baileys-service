@@ -1,3 +1,5 @@
+// server.js — Baileys API (ESM)
+
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -17,6 +19,7 @@ import { fileURLToPath } from "url";
 const app = express();
 app.use(express.json());
 
+// CORS básico
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -65,14 +68,14 @@ function extractNumberFromJid(jid) {
 }
 
 function toE164Digits(input) {
-  // aceita "+55 11 999...","5511999...", "55-11-999..."
+  // aceita "+55 11 999...", "5511999...", "55-11-999..."
   if (!input) return null;
   const digits = String(input).replace(/[^\d]/g, "");
   return digits.length >= 6 ? digits : null;
 }
 
 // ------------------ STATE DE SESSÕES ----------------
-const sessions = new Map();     // id -> meta
+const sessions = new Map(); // id -> meta
 const sessionLocks = new Set();
 
 async function notifyAdmin(meta, text) {
@@ -151,7 +154,9 @@ async function getOrCreateSession(sessionId) {
     sessions.set(sessionId, meta);
 
     sock.ev.on("creds.update", async () => {
-      try { await saveCreds(); } catch (e) {
+      try {
+        await saveCreds();
+      } catch (e) {
         log.error({ sessionId, err: e?.message }, "saveCreds failed");
       }
     });
@@ -162,7 +167,9 @@ async function getOrCreateSession(sessionId) {
       meta.keepaliveTimer = setInterval(async () => {
         try {
           if (meta.status === "connected") {
-            await sock.presenceSubscribe(sock?.user?.id || "status@broadcast").catch(() => {});
+            await sock
+              .presenceSubscribe(sock?.user?.id || "status@broadcast")
+              .catch(() => {});
           }
         } catch {}
       }, KEEPALIVE_MS);
@@ -208,10 +215,16 @@ async function getOrCreateSession(sessionId) {
           lastDisconnect?.error?.statusCode ??
           lastDisconnect?.statusCode;
         const errObj = lastDisconnect?.error;
-        log.warn({ sessionId, code, err: String(errObj?.message || errObj) }, "connection closed");
+        log.warn(
+            { sessionId, code, err: String(errObj?.message || errObj) },
+            "connection closed"
+        );
 
         if (code === DisconnectReason.loggedOut || code === 401) {
-          await notifyAdmin(meta, `🔴 [${sessionId}] Sessão removida (device_removed/loggedOut). Gere novo QR.`);
+          await notifyAdmin(
+            meta,
+            `🔴 [${sessionId}] Sessão removida (device_removed/loggedOut). Gere novo QR.`
+          );
           try { await sock.logout(); } catch {}
           sessions.delete(sessionId);
           return;
@@ -232,7 +245,9 @@ async function getOrCreateSession(sessionId) {
 
         setTimeout(async () => {
           sessions.delete(sessionId);
-          try { await getOrCreateSession(sessionId); } catch (e) {
+          try {
+            await getOrCreateSession(sessionId);
+          } catch (e) {
             log.error({ sessionId, err: e?.message }, "reconnect failed");
           }
         }, backoff);
@@ -283,9 +298,11 @@ app.get("/sessions/:id/qr", requireAuth, async (req, res) => {
 });
 
 // ------- ENVIO: aceita {to,text} ou {number,message} -------
-app.post("/sessions/:id/send", requireAuth, async (req, res) => {
+async function sendMessageHandler(req, res) {
   const meta = await getOrCreateSession(req.params.id);
-  if (meta.status !== "connected") return res.status(409).json({ error: "not_connected" });
+  if (meta.status !== "connected") {
+    return res.status(409).json({ error: "not_connected" });
+  }
 
   // compatibilidade:
   const toRaw = req.body?.to ?? req.body?.number;
@@ -295,24 +312,24 @@ app.post("/sessions/:id/send", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "to/number and text/message are required" });
   }
 
+  // número destino (E.164) -> JID
   const digits = toE164Digits(toRaw);
   if (!digits) return res.status(400).json({ error: "invalid_phone" });
 
   try {
-    const jid = jidNormalizedUser(digits);
-    const r = await meta.sock.sendMessage(jid, { text });
+    const jid = jidNormalizedUser(digits); // evita jidDecode()
+    const r = await meta.sock.sendMessage(jid, { text: String(text) });
     return res.json({ ok: true, id: r?.key?.id || null, to: digits });
   } catch (e) {
-    log.error({ err: e?.message }, "send_error");
-    return res.status(500).json({ ok: false, error: e?.message });
+    log.error({ sessionId: meta.id, err: e?.message }, "send_error");
+    return res.status(500).json({ ok: false, error: e?.message || "send_failed" });
   }
-});
+}
+
+app.post("/sessions/:id/send", requireAuth, sendMessageHandler);
 
 // alias compatível: /messages (front antigo)
-app.post("/sessions/:id/messages", requireAuth, async (req, res) => {
-  req.url = req.url.replace("/messages", "/send");
-  return app._router.handle(req, res);
-});
+app.post("/sessions/:id/messages", requireAuth, sendMessageHandler);
 
 // reset total (apaga credenciais)
 app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
