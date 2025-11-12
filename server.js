@@ -32,7 +32,7 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || "/data";
 
 // MUDE AQUI: COLOQUE O NOME DO SEU APP NO BASE44
-const BASE44_WEBHOOK_URL = "https://SEU_APP_AQUI.base44.app/api/functions/saveInboundWebhook";
+const BASE44_WEBHOOK_URL = "https://connect-flow-71c06c9b.base44.app/api/functions/saveInboundWebhook";
 // EXEMPLO: https://whatsapp-felipe.base44.app/api/functions/saveInboundWebhook
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
