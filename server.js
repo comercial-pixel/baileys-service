@@ -7,6 +7,7 @@ import {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  Browsers,
 } from "@whiskeysockets/baileys";
 import fs from "fs";
 import path from "path";
@@ -16,7 +17,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: "50mb" })); // Suporte a imagens grandes
+app.use(express.json({ limit: "50mb" }));
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -30,7 +31,6 @@ const log = pino({ level: "info" });
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || "/data";
 
-// === MUDE AQUI: URL DO SEU WEBHOOK NO BASE44 ===
 const BASE44_WEBHOOK_URL = "https://connect-flow-71c06c9b.base44.app/api/functions/saveInboundWebhook";
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -42,7 +42,6 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const onlyDigits = v => String(v).replace(/\D/g, "");
 const sanitizeSessionId = id => /^[a-zA-Z0-9_-]{1,50}$/.test(id) ? id : null;
 
-// AUTH SIMPLES (você pode deixar sem ou usar JWT se quiser)
 function requireAuth(req, res, next) {
   const token = (req.headers.authorization || "").replace("Bearer ", "").trim();
   if (!token) return res.status(401).json({ error: "token_required" });
@@ -66,7 +65,7 @@ async function createSession(sessionId) {
       auth: state,
       printQRInTerminal: false,
       logger: log.child({ sessionId }),
-      browser: ["Chrome (Linux)", "", ""],
+      browser: Browsers.macOS('Safari'), // ✅ COMPATÍVEL COM BUSINESS E NORMAL
       markOnlineOnConnect: true,
     });
 
@@ -107,7 +106,6 @@ async function createSession(sessionId) {
       }
     });
 
-    // WEBHOOK PARA INBOX DO BASE44
     sock.ev.on("messages.upsert", async (m) => {
       const msg = m.messages[0];
       if (!msg.key || msg.key.fromMe || !msg.message) return;
@@ -147,7 +145,6 @@ function removeListeners(sock) {
   sock?.ev?.removeAllListeners();
 }
 
-// ====================== ROTA /SEND COM SUPORTE TOTAL A MÍDIA ======================
 app.post("/sessions/:id/send", requireAuth, async (req, res) => {
   const id = sanitizeSessionId(req.params.id);
   if (!id) return res.status(400).json({ error: "invalid_id" });
@@ -158,7 +155,6 @@ app.post("/sessions/:id/send", requireAuth, async (req, res) => {
 
   const { to, text, mediaUrl, mediaType, mimetype, fileName } = req.body;
 
-  // LOG GIGANTE — NUNCA MAIS TEREMOS DÚVIDA
   console.log("\n╔══════════════════════════════════════════╗");
   console.log("  ENVIO RECEBIDO DO BASE44");
   console.log("╚══════════════════════════════════════════╝");
@@ -215,7 +211,6 @@ app.post("/sessions/:id/send", requireAuth, async (req, res) => {
   }
 });
 
-// ====================== OUTRAS ROTAS ======================
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 app.get("/sessions/:id/status", requireAuth, async (req, res) => {
