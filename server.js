@@ -1,4 +1,4 @@
-// server.js — VERSÃO FINAL 100% FUNCIONAL COM MÍDIA (NOVEMBRO 2025)
+// server.js — VERSÃO FINAL 100% FUNCIONAL COM MÍDIA (JUNHO 2026)
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -65,7 +65,7 @@ async function createSession(sessionId) {
       auth: state,
       printQRInTerminal: false,
       logger: log.child({ sessionId }),
-      browser: Browsers.macOS('Safari'), // ✅ COMPATÍVEL COM BUSINESS E NORMAL
+      browser: Browsers.macOS('Safari'),
       markOnlineOnConnect: true,
     });
 
@@ -110,7 +110,11 @@ async function createSession(sessionId) {
       const msg = m.messages[0];
       if (!msg.key || msg.key.fromMe || !msg.message) return;
 
-      const from = msg.key.remoteJid.replace("@s.whatsapp.net", "");
+      // ✅ Ignorar JIDs inválidos (@lid) e status@broadcast
+      const remoteJid = msg.key.remoteJid || "";
+      if (remoteJid.includes("@lid") || remoteJid === "status@broadcast") return;
+
+      const from = remoteJid.replace("@s.whatsapp.net", "");
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
@@ -246,9 +250,4 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
   sessions.delete(id);
   setTimeout(() => createSession(id), 2000);
   res.json({ success: true });
-});
-
-app.listen(PORT, () => {
-  log.info(`SERVIÇO RODANDO NA PORTA ${PORT} — MÍDIA 100% ATIVA`);
-  log.info(`WEBHOOK → ${BASE44_WEBHOOK_URL}`);
 });
