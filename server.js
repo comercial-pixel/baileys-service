@@ -1,4 +1,4 @@
-// server.js — VERSÃO FINAL 100% FUNCIONAL COM MÍDIA (NOVEMBRO 2025)
+// server.js — VERSÃO FINAL COM FIX @LID
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -110,11 +110,28 @@ async function createSession(sessionId) {
       const msg = m.messages[0];
       if (!msg.key || msg.key.fromMe || !msg.message) return;
 
-      // ✅ Ignorar JIDs inválidos (@lid) e status@broadcast
       const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid.includes("@lid") || remoteJid === "status@broadcast") return;
 
-      const from = remoteJid.replace("@s.whatsapp.net", "");
+      // Ignorar status@broadcast
+      if (remoteJid === "status@broadcast") return;
+
+      let from;
+
+      if (remoteJid.includes("@lid")) {
+        // Tentar resolver número real via participant
+        const participant = msg.key.participant || "";
+        if (participant.includes("@s.whatsapp.net")) {
+          from = participant.replace("@s.whatsapp.net", "").replace(/\D/g, "");
+        } else {
+          log.warn({ remoteJid }, "JID @lid sem número resolvível, ignorando");
+          return;
+        }
+      } else {
+        from = remoteJid.replace("@s.whatsapp.net", "").replace(/\D/g, "");
+      }
+
+      if (!from) return;
+
       const text =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
