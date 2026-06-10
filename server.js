@@ -1,4 +1,4 @@
-// server.js — VERSÃO FINAL 100% FUNCIONAL COM MÍDIA (JUNHO 2026)
+// server.js — VERSÃO FINAL 100% FUNCIONAL COM MÍDIA (NOVEMBRO 2025)
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -250,4 +250,9 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
   sessions.delete(id);
   setTimeout(() => createSession(id), 2000);
   res.json({ success: true });
+});
+
+app.listen(PORT, () => {
+  log.info(`SERVIÇO RODANDO NA PORTA ${PORT} — MÍDIA 100% ATIVA`);
+  log.info(`WEBHOOK → ${BASE44_WEBHOOK_URL}`);
 });
