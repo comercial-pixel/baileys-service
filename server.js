@@ -1,4 +1,4 @@
-// server.js — VERSÃO FINAL COM FIX @LID
+// server.js — VERSÃO FINAL COM FIX @LID v2
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -116,18 +116,23 @@ async function createSession(sessionId) {
       if (remoteJid === "status@broadcast") return;
 
       let from;
+      let toJid;
 
       if (remoteJid.includes("@lid")) {
-        // Tentar resolver número real via participant
+        // Tentar participant (grupos)
         const participant = msg.key.participant || "";
         if (participant.includes("@s.whatsapp.net")) {
           from = participant.replace("@s.whatsapp.net", "").replace(/\D/g, "");
+          toJid = participant;
         } else {
-          log.warn({ remoteJid }, "JID @lid sem número resolvível, ignorando");
-          return;
+          // Chat individual com @lid: usar dígitos do @lid como ID e manter o JID original para envio
+          from = remoteJid.replace("@lid", "").replace(/\D/g, "");
+          toJid = remoteJid; // enviar de volta para o @lid original
+          log.info({ remoteJid, from }, "JID @lid → usando ID numérico como identificador");
         }
       } else {
         from = remoteJid.replace("@s.whatsapp.net", "").replace(/\D/g, "");
+        toJid = remoteJid;
       }
 
       if (!from) return;
@@ -147,10 +152,11 @@ async function createSession(sessionId) {
             tenantSlug: sessionId,
             phoneE164: from,
             text: text,
+            originalJid: toJid,
             timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
           }),
         });
-        log.info({ from, sessionId }, "Mensagem recebida → inbox");
+        log.info({ from, toJid, sessionId }, "Mensagem recebida → inbox");
       } catch (err) {
         log.error({ err: err.message }, "Falha no webhook");
       }
@@ -191,7 +197,8 @@ app.post("/sessions/:id/send", requireAuth, async (req, res) => {
   if (!to) return res.status(400).json({ error: "missing_to" });
   if (!text && !mediaUrl) return res.status(400).json({ error: "missing_content" });
 
-  const jid = `${onlyDigits(to)}@s.whatsapp.net`;
+  // Usar o JID exatamente como veio (pode ser @lid ou @s.whatsapp.net)
+  const jid = to.includes("@") ? to : `${onlyDigits(to)}@s.whatsapp.net`;
 
   try {
     let result;
