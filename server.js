@@ -1,4 +1,4 @@
-// server.js — VERSÃO FINAL COM FIX @LID v2
+// server.js — VERSÃO FINAL COM FIX @LID v2 + RECONNECT
 import express from "express";
 import QRCode from "qrcode";
 import pino from "pino";
@@ -112,22 +112,19 @@ async function createSession(sessionId) {
 
       const remoteJid = msg.key.remoteJid || "";
 
-      // Ignorar status@broadcast
       if (remoteJid === "status@broadcast") return;
 
       let from;
       let toJid;
 
       if (remoteJid.includes("@lid")) {
-        // Tentar participant (grupos)
         const participant = msg.key.participant || "";
         if (participant.includes("@s.whatsapp.net")) {
           from = participant.replace("@s.whatsapp.net", "").replace(/\D/g, "");
           toJid = participant;
         } else {
-          // Chat individual com @lid: usar dígitos do @lid como ID e manter o JID original para envio
           from = remoteJid.replace("@lid", "").replace(/\D/g, "");
-          toJid = remoteJid; // enviar de volta para o @lid original
+          toJid = remoteJid;
           log.info({ remoteJid, from }, "JID @lid → usando ID numérico como identificador");
         }
       } else {
@@ -197,7 +194,6 @@ app.post("/sessions/:id/send", requireAuth, async (req, res) => {
   if (!to) return res.status(400).json({ error: "missing_to" });
   if (!text && !mediaUrl) return res.status(400).json({ error: "missing_content" });
 
-  // Usar o JID exatamente como veio (pode ser @lid ou @s.whatsapp.net)
   const jid = to.includes("@") ? to : `${onlyDigits(to)}@s.whatsapp.net`;
 
   try {
@@ -274,6 +270,24 @@ app.post("/sessions/:id/reset", requireAuth, async (req, res) => {
   sessions.delete(id);
   setTimeout(() => createSession(id), 2000);
   res.json({ success: true });
+});
+
+// ✅ NOVO: Reconecta o socket SEM apagar a sessão (sem precisar de novo QR)
+app.post("/sessions/:id/reconnect", requireAuth, async (req, res) => {
+  const id = sanitizeSessionId(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid_id" });
+
+  const meta = sessions.get(id);
+  if (meta?.sock) {
+    removeListeners(meta.sock);
+    try { meta.sock.end(new Error("manual_reconnect")); } catch {}
+  }
+  sessions.delete(id);
+
+  // Recriar sessão usando os arquivos .json existentes (sem apagar /data/:id)
+  setTimeout(() => createSession(id), 1000);
+
+  res.json({ success: true, message: "Reconectando sem apagar sessão..." });
 });
 
 app.listen(PORT, () => {
